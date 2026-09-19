@@ -27,162 +27,12 @@ equation, and Boussinesq buoyancy in the z-momentum (M3).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy as np
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
+from .config import Boundary, Config, FACES, RackSpec, Solid
 from .grid import Grid
 from .kernels import jacobi, linf_residual
-
-
-# ---------------------------------------------------------------------------
-# Boundary specification
-# ---------------------------------------------------------------------------
-@dataclass
-class Boundary:
-    """One domain face. kind in {'wall', 'inlet', 'outlet'}.
-
-    For 'wall', `vel` is the (vx, vy, vz) wall velocity (nonzero for a moving
-    lid); the normal component is forced to zero, tangential components are the
-    no-slip target. For 'inlet', `vel` is the prescribed velocity vector, and
-    `mask_fn(a, b) -> bool array` optionally restricts the inlet to part of the
-    face (a, b are the two in-plane cell-center coordinates); default: whole face.
-    For 'outlet', velocity is extrapolated (zero-gradient) as a predictor; under
-    the default Config.outlet_mode='pressure' the opening is a Dirichlet p=0
-    boundary and the projection then solves for the actual outflow.
-
-    `mask`, `vel_map`, `temp_map` are per-cell alternatives to the scalar
-    `vel`/`temp`, for data-center BCs that vary across a face (a perforated-
-    tile floor, ceiling return tiles): in-plane arrays (shape matching the two
-    non-normal axes, meshgrid 'ij' order) giving, respectively, the opening
-    mask (alternative to `mask_fn`), the prescribed *normal* velocity per
-    opening cell (overrides `vel[normal]`), and the prescribed temperature per
-    opening cell (overrides `temp`).
-    """
-
-    kind: str
-    vel: tuple = (0.0, 0.0, 0.0)
-    mask_fn: object = None
-    temp: float = None  # Dirichlet T at the opening / wall face
-    #                           (None -> adiabatic, zero-gradient in energy)
-    wall_temp: float = None  # Dirichlet T on the *solid remainder* of an
-    #                           inlet/outlet face (the wall around the slot)
-    mask: np.ndarray = None
-    vel_map: np.ndarray = None
-    temp_map: np.ndarray = None
-
-
-@dataclass
-class RackSpec:
-    """A flow-through rack: draws `Q_m3s` in the front face and exhausts it,
-    warmed by `power_W`, out the rear face (Han Eqs. 11-12).
-
-    `axis` is the rack's depth axis ('x', 'y' or 'z'); `front` is the
-    cell-index side of the block ('lo' or 'hi') the intake sits on -- the
-    opposite side is the exhaust. Both faces carry the same signed normal
-    velocity (flow direction = +axis if front='lo', -axis if front='hi').
-    """
-
-    axis: str
-    front: str
-    Q_m3s: float
-    power_W: float
-
-
-@dataclass
-class Solid:
-    """An axis-aligned internal solid block (e.g. the heated box, Case 2).
-
-    `bounds` = (x0, x1, y0, y1, z0, z1) in metres. A cell whose center lies
-    inside the block is blocked: its velocity faces are frozen at zero (no
-    penetration + no-slip) and it is excluded from the pressure system. If
-    `temp` is given, the block's surface is a Dirichlet-T boundary for the
-    energy equation; if None, the surface is adiabatic. For the discretization
-    to place the surface exactly on cell faces, build the grid with faces on
-    the block bounds (as the Case 2 driver does).
-
-    If `rack` is given, the block is a flow-through rack (`RackSpec`): its
-    front/rear faces are prescribed velocities (not frozen at zero) and its
-    rear-face surface temperature is recomputed every step from the front-
-    face inlet temperature (see `Solver._update_rack_exhaust`), overriding
-    `temp`.
-    """
-
-    bounds: tuple
-    temp: float = None
-    rack: RackSpec = None
-
-
-FACES = ("xlo", "xhi", "ylo", "yhi", "zlo", "zhi")
-
-
-@dataclass
-class Config:
-    nu: float = 1.5e-5  # kinematic (molecular) viscosity [m^2/s]
-    dt: float = 0.05  # time step [s]
-    rho: float = 1.2  # density [kg/m^3] (only for reporting)
-    n_mom_sweeps: int = 4  # Jacobi sweeps per momentum solve per step
-    bcs: dict = field(default_factory=dict)  # face name -> Boundary
-    # Turbulence: Chen & Xu (1998) zero-equation, nu_t = C * |V| * l with l the
-    # distance to the nearest wall. `turb_model=None` -> laminar (nu_t = 0).
-    # Outlet treatment. 'pressure' (default): the exhaust opening is a Dirichlet
-    # p=0 boundary and the projection solves for the outflow, so global mass
-    # balance emerges rather than being imposed (and no arbitrary pin cell is
-    # needed).  'velocity': the Zuo & Chen / Han FFD form -- the outflow profile
-    # is extrapolated (zero-gradient) and corrected to match the inflow, with a
-    # Neumann pressure BC everywhere.  Both give the same profiles to within
-    # 0.04 NRMSD points; 'pressure' is numerically cleaner (max|div| ~25x lower
-    # on Case 2) and is what the drivers use.
-    outlet_mode: str = "pressure"  # 'pressure' or 'velocity'
-    # Pressure Poisson solver. The operator is built once and reused every step,
-    # so this only changes *how* the same linear system is solved, never the
-    # system itself; all direct options agree to ~1e-14 relative residual.
-    #   'cholesky'  cholespy Cholesky -- exploits the operator's symmetry
-    #               (fastest measured: 4.1x the default LU back-solve).
-    #               Falls back to 'lu_mmd' if cholespy is not installed.
-    #   'lu_mmd'    SuperLU with MMD_AT_PLUS_A ordering (2.1x, no extra deps).
-    #   'lu'        SuperLU with scipy's default COLAMD ordering (the original).
-    #   'amg'       pyamg Ruge-Stuben + CG, warm-started. Iterative, so it is
-    #               the only option whose accuracy depends on `pressure_tol`.
-    #               Measured ~10x SLOWER than 'cholesky' at 40^3 -- kept because
-    #               it is the option that scales best to much larger grids.
-    # 'cholesky' and 'amg' require a symmetric operator; the operator is always
-    # symmetric here, whether it has a pressure Dirichlet (outlet_mode=
-    # 'pressure') or a pure-Neumann pin (outlet_mode='velocity', or a domain
-    # with no pressure outlet at all, e.g. a data-center case) -- the pin zeros
-    # both its row and column (see _build_pressure_operator).
-    pressure_solver: str = "cholesky"
-    pressure_tol: float = 1e-10  # relative residual; 'amg' only
-    turb_model: str = None  # None or 'chen'
-    turb_C: float = 0.03874  # Chen zero-equation coefficient
-    # Dhoot et al. approximate wall function: cells adjacent to a domain
-    # boundary (wall or inlet/outlet opening) or an internal solid use a
-    # reduced coefficient instead of turb_C. Values (chen_a, jim_a) and the
-    # adjacency rule are taken verbatim from Han's own reference solver,
-    # doetools/isat_ffd, src/ffd_isat/Kernels_3D.cl::nu_t_chen_zero_equ (the
-    # code behind Han et al.'s Table 2 numbers) -- Han's paper cites the wall
-    # function [42] but never states its formula, so this is sourced from the
-    # implementation, not tuned to our own NRMSD.
-    turb_C_wall: float = 0.0185  # isat_ffd's `jim_a`
-    # Energy equation + Boussinesq buoyancy (all ignored unless solve_energy).
-    solve_energy: bool = False
-    alpha: float = 2.1e-5  # molecular thermal diffusivity [m^2/s] (Pr~0.71)
-    # No turbulent-Prandtl division: isat_ffd's diff_T kernel (Kernels_3D.cl,
-    # same source as turb_C_wall above) reuses the momentum eddy viscosity
-    # nu_t UNDIVIDED for the temperature equation's diffusion coefficient
-    # (effectively Pr_t=1). We keep the physically-correct molecular alpha
-    # (the nu-vs-alpha choice is negligible either way -- nu_t/nu ~200-300x
-    # in this flow) but match their turbulent term exactly, since that is the
-    # numerically significant, code-sourced part.
-    beta: float = 1.0 / 295.15  # thermal expansion coefficient [1/K]
-    g: float = 9.81  # gravitational acceleration [m/s^2]
-    T_ref: float = 22.2  # Boussinesq reference temperature (T units)
-    T_init: float = None  # initial uniform T (default: T_ref)
-    n_energy_sweeps: int = 4  # Jacobi sweeps per energy solve per step
-    cp: float = 1006.0  # specific heat [J/kg K] (rack exhaust carry-through)
-    solids: list = field(default_factory=list)  # internal Solid blocks
+from .pressure import build_pressure_operator, make_pressure_solver
 
 
 class Solver:
@@ -311,17 +161,12 @@ class Solver:
             rear_idx = i0
             sign = -1.0
 
-        def axis_slice(idx):
-            sl = [slice(None)] * 3
-            sl[ax] = idx
-            return tuple(sl)
-
         for label, idx in (("front", front_idx), ("rear", rear_outside_idx)):
             if not (0 <= idx < n_axis):
                 raise ValueError(
                     f"rack {spec}: {label} face is at the domain " f"boundary"
                 )
-            if self.solid[axis_slice(idx)][footprint].any():
+            if self.solid[self._axis_slice(ax, idx)][footprint].any():
                 raise ValueError(f"rack {spec}: {label} cell is not fluid")
 
         area2d = self._rack_transverse_area(spec.axis)
@@ -329,8 +174,8 @@ class Solver:
         V = spec.Q_m3s / A_front
 
         vel = self._rack_velocity_array(spec.axis)
-        vel[axis_slice(front_face)][footprint] = sign * V
-        vel[axis_slice(rear_face)][footprint] = sign * V
+        vel[self._axis_slice(ax, front_face)][footprint] = sign * V
+        vel[self._axis_slice(ax, rear_face)][footprint] = sign * V
 
         return (
             spec,
@@ -358,12 +203,11 @@ class Solver:
         """
         rho, cp = self.cfg.rho, self.cfg.cp
         for spec, ax, front_idx, rear_idx, footprint, *_ in self._racks:
-            sl = [slice(None)] * 3
-            sl[ax] = front_idx
-            T_front = self.T[tuple(sl)]
-            sl[ax] = rear_idx
+            T_front = self.T[self._axis_slice(ax, front_idx)]
             dT = spec.power_W / (rho * cp * spec.Q_m3s)
-            self.solid_temp[tuple(sl)][footprint] = T_front[footprint] + dT
+            self.solid_temp[self._axis_slice(ax, rear_idx)][footprint] = (
+                T_front[footprint] + dT
+            )
 
     def set_rack_powers(self, powers_W, flows_m3s):
         """Update every flow-through rack's IT power and intake flow in place,
@@ -766,182 +610,24 @@ class Solver:
             plane[m] += sign * (inflow - cur) / a_open
 
     def _build_pressure_operator(self):
-        """Discrete Laplacian L (SPD) for the pressure, with Neumann boundary condition
-        at walls, inlets, and outlets. RHS is filled each step from the divergence of u*.
-        L p = -(1/dt) div(u*) * Vol.
-        """
-
+        """Assemble and factorize the pressure Poisson operator (see
+        `pressure.build_pressure_operator`) and record the pin cell / shape
+        that `project()` needs to fill the RHS and reshape the solution."""
         g = self.g
-        nx, ny, nz = g.nx, g.ny, g.nz
-        N = nx * ny * nz
-
-        def idx(i, j, k):
-            return (i * ny + j) * nz + k
-
-        Ax = np.multiply.outer(self.dy, self.dz)  # (ny,nz)
-        Ay = np.multiply.outer(self.dx, self.dz)  # (nx,nz)
-        Az = np.multiply.outer(self.dx, self.dy)  # (nx,ny)
-
-        # A face contributes a coefficient A/dist unless it's a domain-boundary
-        # face with a Neumann pressure BC (wall/inlet) -> no term.
-        rows, cols, vals = [], [], []
-        diag = np.zeros(N)
-
-        # A boundary face gets a Dirichlet (p=0) ghost only where an outlet
-        # opening sits (self._pdir); every other boundary face is Neumann
-        # (wall/inlet/slip solid), which contributes no pressure term.
-        pdir = self._pdir
-        S = self.solid
-
-        for i in range(nx):
-            for j in range(ny):
-                for k in range(nz):
-                    P = idx(i, j, k)
-                    # Solid cells are decoupled from the pressure system:
-                    # identity row p=0 (RHS forced to 0 in project()).
-                    if S[i, j, k]:
-                        diag[P] = 1.0
-                        continue
-                    # A face couples two cells only if the neighbour is fluid;
-                    # a solid neighbour is a no-flux (Neumann) interface, just
-                    # like a wall, so it contributes no pressure term.
-                    # East (+x)
-                    if i + 1 < nx:
-                        if not S[i + 1, j, k]:
-                            c = Ax[j, k] / self.dxc[i + 1]
-                            rows.append(P)
-                            cols.append(idx(i + 1, j, k))
-                            vals.append(-c)
-                            diag[P] += c
-                    elif pdir["xhi"][j, k]:
-                        diag[P] += Ax[j, k] / (self.dx[i] * 0.5)
-                    # West (-x)
-                    if i - 1 >= 0:
-                        if not S[i - 1, j, k]:
-                            c = Ax[j, k] / self.dxc[i]
-                            rows.append(P)
-                            cols.append(idx(i - 1, j, k))
-                            vals.append(-c)
-                            diag[P] += c
-                    elif pdir["xlo"][j, k]:
-                        diag[P] += Ax[j, k] / (self.dx[i] * 0.5)
-                    # North (+y)
-                    if j + 1 < ny:
-                        if not S[i, j + 1, k]:
-                            c = Ay[i, k] / self.dyc[j + 1]
-                            rows.append(P)
-                            cols.append(idx(i, j + 1, k))
-                            vals.append(-c)
-                            diag[P] += c
-                    elif pdir["yhi"][i, k]:
-                        diag[P] += Ay[i, k] / (self.dy[j] * 0.5)
-                    # South (-y)
-                    if j - 1 >= 0:
-                        if not S[i, j - 1, k]:
-                            c = Ay[i, k] / self.dyc[j]
-                            rows.append(P)
-                            cols.append(idx(i, j - 1, k))
-                            vals.append(-c)
-                            diag[P] += c
-                    elif pdir["ylo"][i, k]:
-                        diag[P] += Ay[i, k] / (self.dy[j] * 0.5)
-                    # Front (+z)
-                    if k + 1 < nz:
-                        if not S[i, j, k + 1]:
-                            c = Az[i, j] / self.dzc[k + 1]
-                            rows.append(P)
-                            cols.append(idx(i, j, k + 1))
-                            vals.append(-c)
-                            diag[P] += c
-                    elif pdir["zhi"][i, j]:
-                        diag[P] += Az[i, j] / (self.dz[k] * 0.5)
-                    # Back (-z)
-                    if k - 1 >= 0:
-                        if not S[i, j, k - 1]:
-                            c = Az[i, j] / self.dzc[k]
-                            rows.append(P)
-                            cols.append(idx(i, j, k - 1))
-                            vals.append(-c)
-                            diag[P] += c
-                    elif pdir["zlo"][i, j]:
-                        diag[P] += Az[i, j] / (self.dz[k] * 0.5)
-
-        # Pure-Neumann system (no Dirichlet cell anywhere) is singular: pin the
-        # first fluid cell to p=0.
-        any_dirichlet = any(pdir[f].any() for f in FACES)
-        rows.extend(range(N))
-        cols.extend(range(N))
-        vals.extend(diag)
-        L = sp.csc_matrix((vals, (rows, cols)), shape=(N, N))
-        if not any_dirichlet:
-            pin = int(np.argmin(S.reshape(-1)))  # first fluid cell
-            L = L.tolil()
-            L[pin, :] = 0.0
-            L[:, pin] = 0.0
-            L[pin, pin] = 1.0
-            L = L.tocsc()
-            self._pin_cell = pin
-        else:
-            self._pin_cell = None
-        self._N = N
-        self._idx_shape = (nx, ny, nz)
-        self.Lsolve = self._make_pressure_solver(L)
-
-    def _make_pressure_solver(self, L):
-        """Build the reusable pressure solve for cfg.pressure_solver.
-
-        See Config.pressure_solver. The pin (if any) is applied symmetrically
-        (see _build_pressure_operator), so every pressure_solver option is
-        available regardless of whether the domain has a pressure outlet.
-        """
-        want = self.cfg.pressure_solver
-        N = L.shape[0]
-        if want == "cholesky":
-            try:
-                from cholespy import CholeskySolverD, MatrixType
-            except ImportError:
-                want = "lu_mmd"
-            else:
-                coo = L.tocoo()
-                chol = CholeskySolverD(
-                    N,
-                    coo.row.astype(np.int32),
-                    coo.col.astype(np.int32),
-                    coo.data.astype(np.float64),
-                    MatrixType.COO,
-                )
-                buf = np.empty(N)
-
-                def solve(rhs, _c=chol, _b=buf):
-                    _c.solve(np.ascontiguousarray(rhs, dtype=np.float64), _b)
-                    return _b.copy()  # caller keeps the result as self.p
-
-                self.pressure_solver_used = "cholesky"
-                return solve
-        if want == "amg":
-            try:
-                import pyamg
-            except ImportError:
-                # pyamg is the default backend but an optional dependency; when
-                # it is not installed, fall back to the scipy-only sparse LU.
-                want = "lu_mmd"
-            else:
-                ml = pyamg.ruge_stuben_solver(L.tocsr())
-                tol = self.cfg.pressure_tol
-                last = {"x": np.zeros(N)}
-
-                def solve(rhs, _ml=ml, _t=tol, _s=last):
-                    x = _ml.solve(rhs, x0=_s["x"], tol=_t, accel="cg", maxiter=200)
-                    _s["x"] = x
-                    return x
-
-                self.pressure_solver_used = "amg"
-                return solve
-        if want == "lu_mmd":
-            self.pressure_solver_used = "lu_mmd"
-            return spla.splu(L.tocsc(), permc_spec="MMD_AT_PLUS_A").solve
-        self.pressure_solver_used = "lu"
-        return spla.factorized(L)
+        L, self._pin_cell = build_pressure_operator(
+            g,
+            self.dx,
+            self.dy,
+            self.dz,
+            self.dxc,
+            self.dyc,
+            self.dzc,
+            self._pdir,
+            self.solid,
+        )
+        self._N = g.nx * g.ny * g.nz
+        self._idx_shape = (g.nx, g.ny, g.nz)
+        self.Lsolve, self.pressure_solver_used = make_pressure_solver(L, self.cfg)
 
     def divergence(self, u=None, v=None, w=None):
         """Cell-centered divergence of the (staggered) velocity field."""
@@ -1417,20 +1103,8 @@ class Solver:
         return aP, {"aE": aE, "aW": aW, "aN": aN, "aS": aS, "aF": aF, "aB": aB, "b": b}
 
     def solve_energy_step(self):
-        c = self._assemble_T()
-        aP, co = c
-        jacobi(
-            self.T,
-            aP,
-            co["aE"],
-            co["aW"],
-            co["aN"],
-            co["aS"],
-            co["aF"],
-            co["aB"],
-            co["b"],
-            self.solid,
-            self.cfg.n_energy_sweeps,
+        self._jacobi_solve(
+            self.T, self.solid, self._assemble_T(), self.cfg.n_energy_sweeps
         )
 
     def buoyancy_source(self):
@@ -1446,85 +1120,45 @@ class Solver:
     # ------------------------------------------------------------------
     # Time integration
     # ------------------------------------------------------------------
+    # Coefficient keys in the order the Jacobi/residual kernels expect them,
+    # right after aP (see kernels.jacobi / kernels.linf_residual).
+    _COEFFS = ("aE", "aW", "aN", "aS", "aF", "aB", "b")
+
+    def _jacobi_solve(self, field, fixed, assembled, sweeps):
+        """Run `sweeps` in-place Jacobi sweeps on an (aP, coeff-dict) system."""
+        aP, c = assembled
+        jacobi(field, aP, *[c[k] for k in self._COEFFS], fixed, sweeps)
+
+    def _residual_of(self, field, fixed, assembled):
+        """Normalized L-inf residual of an (aP, coeff-dict) system; see
+        `residuals` for the normalization."""
+        aP, c = assembled
+        r = linf_residual(field, aP, *[c[k] for k in self._COEFFS], fixed)
+        scale = np.abs(aP * field)[~fixed].max()
+        return float(r / scale) if scale > 0 else float(r)
+
     def momentum_predict(self, source=None):
         ns = self.cfg.n_mom_sweeps
-        aP, c = self._assemble_u()
-        jacobi(
-            self.u,
-            aP,
-            c["aE"],
-            c["aW"],
-            c["aN"],
-            c["aS"],
-            c["aF"],
-            c["aB"],
-            c["b"],
-            self.u_fixed,
-            ns,
-        )
-        aP, c = self._assemble_v()
-        jacobi(
-            self.v,
-            aP,
-            c["aE"],
-            c["aW"],
-            c["aN"],
-            c["aS"],
-            c["aF"],
-            c["aB"],
-            c["b"],
-            self.v_fixed,
-            ns,
-        )
-        aP, c = self._assemble_w(source=source)
-        jacobi(
-            self.w,
-            aP,
-            c["aE"],
-            c["aW"],
-            c["aN"],
-            c["aS"],
-            c["aF"],
-            c["aB"],
-            c["b"],
-            self.w_fixed,
-            ns,
-        )
+        self._jacobi_solve(self.u, self.u_fixed, self._assemble_u(), ns)
+        self._jacobi_solve(self.v, self.v_fixed, self._assemble_v(), ns)
+        self._jacobi_solve(self.w, self.w_fixed, self._assemble_w(source=source), ns)
         self.apply_velocity_bcs()
 
     def residuals(self):
         """Max-norm of the discrete linear-system residual ||b - A*psi||_inf
         for each implicitly solved field, assembled from the CURRENT fields and
         normalized by max|aP*psi| over the solved cells (dimensionless)."""
-
-        def _one(field, fixed, assembled):
-            aP, c = assembled
-            r = linf_residual(
-                field,
-                aP,
-                c["aE"],
-                c["aW"],
-                c["aN"],
-                c["aS"],
-                c["aF"],
-                c["aB"],
-                c["b"],
-                fixed,
-            )
-            scale = np.abs(aP * field)[~fixed].max()
-            return float(r / scale) if scale > 0 else float(r)
-
         out = {
-            "u": _one(self.u, self.u_fixed, self._assemble_u()),
-            "v": _one(self.v, self.v_fixed, self._assemble_v()),
+            "u": self._residual_of(self.u, self.u_fixed, self._assemble_u()),
+            "v": self._residual_of(self.v, self.v_fixed, self._assemble_v()),
         }
         src = None
         if self.cfg.solve_energy:
-            out["T"] = _one(self.T, self.solid, self._assemble_T())
+            out["T"] = self._residual_of(self.T, self.solid, self._assemble_T())
             src = self.buoyancy_source()
         if self.w_source_extra is not None:
             src = self.w_source_extra if src is None else src + self.w_source_extra
-        out["w"] = _one(self.w, self.w_fixed, self._assemble_w(source=src))
+        out["w"] = self._residual_of(self.w, self.w_fixed, self._assemble_w(source=src))
         return out
 
     def step(self):
