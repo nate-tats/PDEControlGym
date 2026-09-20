@@ -2,14 +2,10 @@
 """Generate ceiling_map.txt: N ceiling return tiles evenly spaced above the
 hot aisles of a layout.
 
-Han gives fixed-flow ceiling outlets but not their positions (Section
-2.2.2.1 / Fig 9 has no ceiling-tile drawing), so this placement is our own
-choice, not a digitization. A "hot aisle" band is the line directly behind a
-rack's rear (exhaust) face -- opposite its `facing` direction: a vertical
-band (fixed x) for x-facing racks, a horizontal band (fixed y) for y-facing
-racks. n_tiles are distributed across bands proportional to each band's
-occupied length (largest-remainder rounding), then spaced as evenly as
-possible along each band.
+Han gives fixed-flow ceiling outlets but not their positions (Section 2.2.2.1 / 
+Fig 9 has no ceiling-tile drawing); this file documents how we chose to place
+the tiles for validation. n_tiles are distributed across exhaust aisles
+proportional to their's occupied length and spaced as evenly as possible.
 
 Run:  ../../.venv/bin/python3 make_ceiling_map.py <layout_dir> <n_tiles>
 """
