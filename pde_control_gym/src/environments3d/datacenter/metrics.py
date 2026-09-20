@@ -1,9 +1,5 @@
 """Rack-inlet sampling, PRD_*, RCI_*, T_max_in, energy closure (Han et al. 2021
-Eqs. 14-16, 18-22).
-
-Pure post-processing: every function here takes a solved `Solver`/`grid`/
-`layout` (or, for the RCI/PRD/count functions, plain arrays) and returns
-numbers -- no solving happens in this module.
+Eqs. 14-16, 18-22). Not part of the solver, but used for validation and env rewards.
 """
 
 from __future__ import annotations
